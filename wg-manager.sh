@@ -1,13 +1,13 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════
-#  WireGuard SAFE Manager — v5.4
+#  WireGuard SAFE Manager — v5.4.1
 #  Run without arguments for the menu, or: wg-manager help
 # ═══════════════════════════════════════════════
 
 # فایل‌هایی که میسازیم (لاگ، بکاپ، کانفیگ) فقط برای root قابل خوندن باشن
 umask 077
 
-VERSION="5.4"
+VERSION="5.4.1"
 BASE_DIR="/root/wg"
 BACKUP_DIR="$BASE_DIR/backup"
 LOG_FILE="/var/log/wg-manager.log"
@@ -1902,7 +1902,7 @@ _add() {
         echo -e "    ${BOLD}1)${NC} Paste config text   ${GREEN}(fastest)${NC}"
         echo -e "    ${BOLD}2)${NC} Config file on this server"
         echo -e "    ${BOLD}3)${NC} Enter fields one by one"
-        echo -e "    ${BOLD}4)${NC} Many Mullvad configs at once ${DIM}(.zip or folder)${NC}"
+        echo -e "    ${BOLD}4)${NC} Many configs at once ${DIM}(.zip or folder — Mullvad or any provider)${NC}"
         echo ""
         prompt choice "Method" "1" v_menu_1_4 || return 1
         case "$choice" in 1) mode=paste ;; 2) mode=file ;; 3) mode=manual ;; 4) mode=bulk ;; esac
@@ -1911,7 +1911,7 @@ _add() {
 
     case "$mode" in
         bulk)
-            [ -n "$src" ] || prompt src "Path to the Mullvad .zip or folder" || return 1
+            [ -n "$src" ] || prompt src "Path to the .zip or folder with WireGuard configs" || return 1
             cmd_import_bulk "$src"
             return
             ;;
@@ -2788,32 +2788,43 @@ cmd_restore() {
 }
 
 # ════════════════════════════════════════════════
-#  CMD: import (چندتایی) — zip یا پوشه کانفیگ‌های Mullvad
+#  CMD: import (چندتایی) — zip یا پوشه کانفیگ‌های WireGuard (Mullvad یا هر سرویس دیگه)
 #  تونل جدید → mark آزاد؛ تونلی که از قبل هست → آپدیت (mark و on/off خودش میمونه)
 # ════════════════════════════════════════════════
 # فقط اسم فایل (بدون مسیر) استخراج میشه → فایل zip نمیتونه بیرون از پوشه موقت بنویسه
+# zip → <dst>/<شماره> ؛ خروجی: "<شماره>\t<اسم اصلی فایل>" برای هر فایل
+# (اسم اصلی هر چی باشه — فاصله، پرانتز، # — فایل نوشته میشه؛ اسم تونل بعداً ساخته میشه)
 PY_UNZIP='
-import os, re, sys, zipfile
+import os, sys, zipfile
 src, dst = sys.argv[1], sys.argv[2]
 n = 0
 with zipfile.ZipFile(src) as z:
     for info in z.infolist():
         if info.is_dir() or info.file_size > 65536:
             continue
-        base = os.path.basename(info.filename)
-        if not base.lower().endswith(".conf") or not re.match(r"^[A-Za-z0-9_.+=-]+$", base):
+        base = info.filename.replace("\\", "/").rsplit("/", 1)[-1]
+        if base.startswith("._") or "__MACOSX" in info.filename:
             continue
-        with z.open(info) as fsrc, open(os.path.join(dst, base), "wb") as fdst:
-            fdst.write(fsrc.read())
+        if not base.lower().endswith((".conf", ".txt")):
+            continue
         n += 1
-print(n)
+        with z.open(info) as fsrc, open(os.path.join(dst, str(n)), "wb") as fdst:
+            fdst.write(fsrc.read())
+        print("%d\t%s" % (n, base.replace("\t", " ").replace("\n", " ")))
 '
 
-# اسم تونل از اسم فایل: mullvad-de-fra-wg-203.conf → de-fra-wg-203
+# اسم تونل از اسم فایل (هر سرویسی):
+#   mullvad-de-fra-wg-203.conf → de-fra-wg-203 · "US-NY#12.conf" → us-ny-12
+#   us-nyc.prod.surfshark.com_wg.conf → us-nyc · "Germany (1).conf" → germany-1
+# حداکثر ۱۵ کاراکتر (محدودیت لینوکس برای اسم اینترفیس)
 bulk_name() {
     local n
-    n=$(basename "$1" | sed -E 's/\.[Cc][Oo][Nn][Ff]$//; s/^[Mm][Uu][Ll][Ll][Vv][Aa][Dd][-_]//' | tr 'A-Z' 'a-z' | sed -E 's/[^a-z0-9_=+.-]/-/g' | cut -c1-15)
-    [[ "$n" =~ $NAME_RE ]] || return 1
+    n=$(printf '%s' "$1" | sed -E 's/\.([Cc][Oo][Nn][Ff]|[Tt][Xx][Tt])$//' | tr 'A-Z' 'a-z' | sed -E '
+        s/^(mullvad|protonvpn|proton|surfshark|ivpn|windscribe|nordvpn|nord|pia|airvpn|azirevpn|ovpn|torguard|purevpn|cyberghost|wireguard|wg)[-_ ]+//
+        s/\.prod\.surfshark\.com//
+        s/[-_ ](wg|wireguard|udp)$//
+        s/[^a-z0-9_=+.-]+/-/g; s/-+/-/g; s/^[-.=+]+//; s/[-.]+$//' | cut -c1-15 | sed -E 's/[-.=+]+$//')
+    [ -n "$n" ] && [[ "$n" =~ $NAME_RE ]] || return 1
     echo "$n"
 }
 
@@ -2832,31 +2843,59 @@ bulk_select() {   # bulk_select <filter> <names...> → اسم‌های انتخ
 cmd_import_bulk() {
     local src="$1" stage f n t old_t i count=0 filter total
     local names=() sel=() actions=() marks=() start=() names_plan=() taken=" " cc_list shown="" old_en
-    header "Import Mullvad configs"
+    local id orig base k sums=" " sum
+    header "Import WireGuard configs"
     new_tmp stage dir || { err "Could not create a temp dir in $RUN_DIR"; return 1; }
+    mkdir -p "$stage/raw" "$stage/out"
+    : > "$stage/list"
 
+    # ۱) همه فایل‌های .conf/.txt (پوشه: تا ۳ سطح زیرپوشه) → raw/<شماره> + list
     if [ -d "$src" ]; then
-        find "$src" -maxdepth 1 -type f -name '*.conf' -size -64k -exec cp {} "$stage"/ \; 2>/dev/null
-    elif [ -f "$src" ] && [[ "$src" == *.zip ]]; then
+        i=0
+        while IFS= read -r -d '' f; do
+            case "$(basename "$f")" in ._*) continue ;; esac
+            i=$((i + 1))
+            cp "$f" "$stage/raw/$i" 2>/dev/null && printf '%s\t%s\n' "$i" "$(basename "$f" | tr '\t' ' ')" >> "$stage/list"
+        done < <(find "$src" -maxdepth 4 -type f \( -iname '*.conf' -o -iname '*.txt' \) -size -64k -print0 2>/dev/null)
+    elif [ -f "$src" ] && [[ "$src" == *.[Zz][Ii][Pp] ]]; then
         command -v python3 &>/dev/null || { err "python3 is needed to read zip files"; return 1; }
-        python3 -I -c "$PY_UNZIP" "$src" "$stage" >/dev/null 2>&1 || { err "Could not read $src (is it a zip file?)"; return 1; }
+        python3 -I -c "$PY_UNZIP" "$src" "$stage/raw" > "$stage/list" 2>/dev/null || { err "Could not read $src (is it a zip file?)"; return 1; }
     else
-        err "Give a .zip file or a folder with .conf files"
+        err "Give a .zip file or a folder with WireGuard .conf files"
         return 1
     fi
 
-    # فایل‌ها → اسم‌ها
-    for f in "$stage"/*.conf; do
+    # ۲) فقط کانفیگ‌های WireGuard → out/<اسم تونل>.conf
+    #    دو فایل با یه اسم → دومی "-2" میگیره (هیچ‌کدوم جای اون یکی رو نمیگیره)؛ فایل تکراری عیناً → یه بار
+    while IFS=$'\t' read -r id orig; do
+        f="$stage/raw/$id"
         [ -f "$f" ] || continue
-        n=$(bulk_name "$f") || continue
-        [ "$f" = "$stage/$n.conf" ] || mv -f "$f" "$stage/$n.conf"
-    done
-    while read -r n; do [ -n "$n" ] && names+=("$n"); done < <(ls -1 "$stage"/*.conf 2>/dev/null | xargs -n1 basename 2>/dev/null | sed 's/\.conf$//' | sort -u)
+        grep -qiE '^[[:space:]]*\[interface\]' "$f" 2>/dev/null || continue
+        # همون فایل دوبار (مثلاً "x.conf" و "x copy.conf") → یه بار
+        sum=$(cksum < "$f" | awk '{print $1 "-" $2}')
+        [[ "$sums" == *" $sum "* ]] && continue
+        if ! n=$(bulk_name "$orig"); then warn "Skipped '$orig' — could not make a tunnel name from it"; continue; fi
+        base="$n"; k=1
+        while [ -e "$stage/out/$n.conf" ]; do
+            if cmp -s "$f" "$stage/out/$n.conf"; then n=""; break; fi
+            k=$((k + 1))
+            n="${base:0:$((14 - ${#k}))}"
+            n="${n%%[-.=+]}-$k"
+        done
+        [ -n "$n" ] || continue
+        cp "$f" "$stage/out/$n.conf"
+        sums="$sums$sum "
+        if [ "$n" != "$base" ]; then
+            note "'$orig' → $n (the name $base was already taken by another file)"
+        fi
+    done < "$stage/list"
+    stage="$stage/out"
+    for f in "$stage"/*.conf; do [ -f "$f" ] && names+=("$(basename "$f" .conf)"); done   # glob = مرتب
     total=${#names[@]}
-    if [ "$total" -eq 0 ]; then err "No WireGuard .conf files found in $src"; return 1; fi
+    if [ "$total" -eq 0 ]; then err "No WireGuard configs found in $src (looked for .conf/.txt files with an [Interface] section)"; return 1; fi
 
     # خلاصه بر اساس کشور
-    cc_list=$(printf '%s\n' "${names[@]}" | awk -F- 'NF > 2 { c[$1]++ } END { for (k in c) printf "%s %d  ", k, c[k] }')
+    cc_list=$(printf '%s\n' "${names[@]}" | awk -F- '$1 ~ /^[a-z][a-z]$/ && $2 ~ /^[a-z][a-z][a-z]$/ && $3 == "wg" { c[$1]++ } END { for (k in c) printf "%s %d  ", k, c[k] }')
     ok "$total configs found"
     [ -n "$cc_list" ] && note "by country: $cc_list"
 
@@ -2864,7 +2903,7 @@ cmd_import_bulk() {
         filter=all
     else
         echo ""
-        note "Pick by country (de), city (de-fra), exact name (de-fra-wg-203), several with commas, or all"
+        note "Pick: all · start of the name (de, de-fra, us) · exact name · several with commas"
         prompt filter "Which ones" || return 1
     fi
     while read -r n; do [ -n "$n" ] && sel+=("$n"); done < <(bulk_select "$filter" "${names[@]}")
@@ -3375,7 +3414,7 @@ Usage: wg-manager [command] [tunnel] [options]
   add                   add a tunnel (paste / file / manual)
   paste [name]          add by pasting the whole config
   import <file> [name]  add from a .conf file
-  import <zip|folder>   add/update many Mullvad configs at once (pick by country/city)
+  import <zip|folder>   add/update many WireGuard configs at once (Mullvad or any provider)
   create                add by entering fields one by one
   enable  [tunnel]      start + keep on after reboot   (alias: load, up)
   disable [tunnel]      stop + keep off after reboot   (alias: down)
@@ -3420,7 +3459,7 @@ show_help() {
     echo -e "  ${BOLD}x2${NC}         Xray outbound JSON for tunnel #2"
     echo -e "  ${BOLD}a${NC} add   ${BOLD}m${NC} monitor   ${BOLD}t${NC} test all   ${BOLD}d${NC} doctor   ${BOLD}s${NC} status   ${BOLD}l${NC} logs   ${BOLD}q${NC} quit"
     echo -e "  Type a command name for the rest: ${BOLD}import rollback backup restore install up-all down-all delete${NC}"
-    echo -e "  ${DIM}import = many Mullvad configs from a .zip or folder · rollback = earlier version of a config (with diff)${NC}"
+    echo -e "  ${DIM}import = many WireGuard configs from a .zip or folder (any provider) · rollback = earlier version of a config (with diff)${NC}"
     echo -e "  ${DIM}Ctrl+C stops the current action and comes back here.${NC}"
     echo ""
     echo -e "  ${BOLD}${CYAN}Command line${NC}"
@@ -3733,7 +3772,7 @@ tunnel_menu() {
 # ════════════════════════════════════════════════
 PALETTE=(
 "a|add a tunnel (paste a config)|new paste create config conf file|add"
-"i|import Mullvad configs (.zip or folder)|bulk zip folder mullvad many download|import"
+"i|import WireGuard configs (.zip or folder, any provider)|bulk zip folder mullvad proton surfshark provider many download|import"
 "#|open a tunnel page (details + actions)|details info show page uptime endpoint|open"
 "r#|restart a tunnel|reconnect reload restart fix|restart"
 "t#|test a tunnel (exit IP, leaks, ping, MTU)|check ip exit leak ping mtu speed|test"
@@ -3893,7 +3932,7 @@ show_menu() {
             echo -e "  ${DIM}         e.g. 2 · r2 · r 1,3 · t all${NC}"
         fi
         hint_row general "/" " search everything" a dd m onitor t "est all" d octor s tatus l ogs "?" " help" q uit
-        hint_row tools i "mport Mullvad" u "ndo (rollback)" b ackup "restore" "" "install" "" "up-all" "" "down-all" ""
+        hint_row tools i "mport configs" u "ndo (rollback)" b ackup "restore" "" "install" "" "up-all" "" "down-all" ""
     fi
     echo ""
     if [ -n "$TOAST" ]; then echo -e "  $TOAST"; echo ""; TOAST=""; fi
@@ -3981,7 +4020,7 @@ menu() {
     done
 }
 env_verbose() { VERBOSE=1 "$@"; }
-env_bulk() { local src; prompt src "Path to the Mullvad .zip or folder" || return 1; cmd_import_bulk "$src"; }
+env_bulk() { local src; prompt src "Path to the .zip or folder with WireGuard configs" || return 1; cmd_import_bulk "$src"; }
 
 # ════════════════════════════════════════════════
 #  MAIN — کل برنامه داخل یه تابعه و آخرش exit: اگه فایل وسط اجرا عوض بشه
@@ -4072,7 +4111,7 @@ main() {
         add)                 cmd_add ;;
         paste)               cmd_add paste "" "$ARG1" ;;
         import)
-            [ -n "$ARG1" ] || { err "Usage: wg-manager import <file.conf|mullvad.zip|folder> [name]"; exit 1; }
+            [ -n "$ARG1" ] || { err "Usage: wg-manager import <file.conf|configs.zip|folder> [name]"; exit 1; }
             # zip یا پوشه → چندتایی؛ یه فایل .conf → مثل قبل
             if [ -d "$ARG1" ] || [[ "$ARG1" == *.zip ]]; then cmd_import_bulk "$ARG1"
             else cmd_add file "$ARG1" "$ARG2"; fi ;;

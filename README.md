@@ -6,6 +6,7 @@ A single bash script that manages Mullvad WireGuard tunnels that Xray uses throu
 - Keeps the rules alive when `systemd-networkd` restarts (drop-in + hook)
 - Watchdog (systemd timer, every 5 min): repairs routing, restarts dead tunnels with backoff
 - Real-path tests through the mark: exit IP v4/v6, leak detection, ping, MTU
+- Bulk import from a .zip or folder of WireGuard configs from Mullvad or any other provider
 - Leak counter (counts only, blocks nothing), backup/restore, rollback with diff
 - Interactive menu: health banner with one-key fix, `/` search for every action, phone layout, live monitor
 
