@@ -1,13 +1,13 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════
-#  WireGuard SAFE Manager — v5.4.1
+#  WireGuard SAFE Manager — v5.4.2
 #  Run without arguments for the menu, or: wg-manager help
 # ═══════════════════════════════════════════════
 
 # فایل‌هایی که میسازیم (لاگ، بکاپ، کانفیگ) فقط برای root قابل خوندن باشن
 umask 077
 
-VERSION="5.4.1"
+VERSION="5.4.2"
 BASE_DIR="/root/wg"
 BACKUP_DIR="$BASE_DIR/backup"
 LOG_FILE="/var/log/wg-manager.log"
@@ -119,7 +119,8 @@ log_file() {
     local plain
     # %s (نه %b) تا بک‌اسلش داخل پیام تفسیر نشه؛ کدهای رنگ (خام یا \033) حذف میشن
     plain=$(printf '%s' "$*" | sed 's/\x1b\[[0-9;]*m//g; s/\\033\[[0-9;]*m//g')
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $plain" >> "$LOG_FILE"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $plain" 2>/dev/null >> "$LOG_FILE"
+    return 0    # دیسک پر نباید باعث بشه apply_routing/tunnel_up «ناموفق» حساب بشن
 }
 
 # write_file <mode> <path> — محتوا از stdin. اتمیک: فایل موقت کنار مقصد + mv
@@ -147,7 +148,7 @@ cleanup() {
     [ ${#TMP_PATHS[@]} -gt 0 ] && rm -rf "${TMP_PATHS[@]}"
 }
 trap cleanup EXIT
-trap 'echo ""; exit 130' INT TERM
+trap 'echo ""; exit 130' INT TERM HUP     # HUP: قطع شدن SSH → فایل‌های موقت (با کلید) پاک بشن
 
 # new_tmp <var> [dir] — فایل (یا پوشه) موقت داخل $RUN_DIR (توی RAM، نه /tmp روی دیسک)
 # که موقع خروج حتماً پاک میشه. کلید خصوصی هیچ‌وقت توی /tmp نمیره
@@ -170,7 +171,8 @@ trim() {
 # ── پرسیدن با پیش‌فرض و اعتبارسنجی ──────────────
 # prompt <var> <text> [default] [validator]
 # ورودی خالی: پیش‌فرض (اگه باشه) وگرنه لغو. ورودی نامعتبر: دوباره میپرسه
-prompt() {
+prompt() { ask_unlocked _prompt "$@"; }
+_prompt() {
     local __var="$1" __text="$2" __def="${3:-}" __val="${4:-}" __in
     if [ "$ASSUME_YES" = 1 ] && [ -n "$__def" ]; then
         if [ -n "$__val" ] && ! "$__val" "$__def"; then return 1; fi
@@ -205,7 +207,8 @@ prompt() {
 }
 
 # confirm <text> [y|n]
-confirm() {
+confirm() { ask_unlocked _confirm "$@"; }
+_confirm() {
     local def="${2:-y}" hint ans
     [ "$ASSUME_YES" = 1 ] && return 0
     if [ ! -t 0 ]; then
@@ -228,12 +231,12 @@ check_root() {
 
 check_deps() {
     local missing=() c
-    for c in wg wg-quick ip iptables awk sed; do
+    for c in wg wg-quick ip iptables awk sed flock; do
         command -v "$c" &>/dev/null || missing+=("$c")
     done
     if [ ${#missing[@]} -gt 0 ]; then
         err "Missing required tools: ${missing[*]}"
-        note "Install with: apt install -y wireguard-tools iproute2 iptables"
+        note "Install with: apt install -y wireguard-tools iproute2 iptables util-linux"
         exit 1
     fi
 }
@@ -246,28 +249,45 @@ has_ipv6() { [ -f /proc/net/if_inet6 ]; }
 # ── قفل: دو نسخه همزمان (مثلاً watchdog و دستی) به هم نخورن ──
 # lock [try] — با try اگه قفل گرفته بود فوراً برمیگرده
 lock() {
-    command -v flock &>/dev/null || return 0
-    exec 9>"$LOCK_FILE" || return 0
-    flock -n 9 && return 0
+    command -v flock &>/dev/null || { err "flock is missing (apt install util-linux)"; return 1; }
+    exec 9>"$LOCK_FILE" || { err "Could not open the lock file $LOCK_FILE"; return 1; }
+    flock -n 9 && { LOCK_HELD=1; return 0; }
     [ "${1:-}" = try ] && return 1
     note "Waiting for another wg-manager to finish..."
     flock -w 60 9 || { err "Another wg-manager is still running"; return 1; }
+    LOCK_HELD=1
 }
-unlock() { exec 9>&- 2>/dev/null; }
+unlock() { exec 9>&- 2>/dev/null; LOCK_HELD=0; }
+LOCK_HELD=0
+# موقع منتظر جواب کاربر موندن، قفل آزاد میشه (تا watchdog بلاک نشه) و بعدش دوباره گرفته میشه
+ask_unlocked() {   # ask_unlocked <command...>
+    local __au_rc __au_relock=0     # اسم‌های عجیب: prompt متغیر caller رو با printf -v مینویسه
+    if [ "$LOCK_HELD" = 1 ] && [ -t 0 ] && [ "$ASSUME_YES" != 1 ]; then __au_relock=1; unlock; fi
+    "$@"; __au_rc=$?
+    if [ "$__au_relock" = 1 ] && ! lock; then
+        err "Could not get the lock back after your answer — stopping (nothing more was changed)"
+        exit 1      # توی منو فقط همون کار (subshell) تموم میشه
+    fi
+    return $__au_rc
+}
 run_locked() { local rc; lock || return 1; "$@"; rc=$?; unlock; return $rc; }
 
 # ── اعتبارسنجی ورودی‌ها ──────────────────────────
 # اولین حرف نباید - یا . باشه (وگرنه ip/wg ممکنه به عنوان option بخونن)
 NAME_RE='^[a-zA-Z0-9_][a-zA-Z0-9_=+.-]{0,14}$'
 v_name() {
-    if [[ ! "$1" =~ $NAME_RE ]]; then
-        err "Invalid name '$1' (letters, digits, _ = + . - only, max 15 chars, must not start with - or .)"
+    if [[ ! "$1" =~ $NAME_RE ]] || [[ "$1" == *+ ]]; then
+        err "Invalid name '$1' (letters, digits, _ = + . - only, max 15 chars, must not start with - or . or end with +)"
         return 1
     fi
 }
 
 v_new_name() {
     v_name "$1" || return 1
+    if [ "$1" = all ] || [[ "$1" =~ ^[0-9]+$ ]]; then
+        err "'$1' can't be a tunnel name (it means 'all' / a row number in commands)"
+        return 1
+    fi
     if [ -f "$(cfg_path "$1")" ]; then
         err "A tunnel named '$1' already exists"
         return 1
@@ -281,7 +301,8 @@ v_new_name() {
 # TABLE_SELF = اسم تونلی که داره ویرایش میشه (تا table خودش تکراری حساب نشه)
 v_table() {
     local t="$1" owner
-    if [[ ! "$t" =~ ^[0-9]+$ ]] || [ "$t" -lt $TABLE_MIN ] || [ "$t" -gt $TABLE_MAX ]; then
+    # بدون صفر اول: 0144 توی bash و ip هشت‌هشتی خونده میشه (= 100)
+    if [[ ! "$t" =~ ^[1-9][0-9]*$ ]] || [ "$t" -lt $TABLE_MIN ] || [ "$t" -gt $TABLE_MAX ]; then
         err "Table ID must be a number between $TABLE_MIN and $TABLE_MAX"
         return 1
     fi
@@ -362,7 +383,8 @@ conf_get_all() {
             i = index($0, "="); if (!i) next
             key = substr($0, 1, i - 1); gsub(/[ \t]/, "", key)
             if (tolower(key) == k) {
-                v = substr($0, i + 1); gsub(/^[ \t]+|[ \t]+$/, "", v); print v
+                v = substr($0, i + 1); sub(/#.*/, "", v)     # مثل wg-quick: "# ..." آخر خط کامنته
+                gsub(/^[ \t]+|[ \t]+$/, "", v); print v
             }
         }' "$1"
 }
@@ -402,6 +424,8 @@ sanitize_config() {
     SANITIZE_NOTES=()
 
     sed -i 's/\r$//; s/^[[:space:]]\+//' "$cfg"
+    # [INTERFACE] / [peer] ... → [Interface] / [Peer] (wg-quick حروف رو مهم نمیدونه؛ sed های بعدی میدونن)
+    sed -i -E 's/^\[[Ii][Nn][Tt][Ee][Rr][Ff][Aa][Cc][Ee]\][[:space:]]*(#.*)?$/[Interface]/; s/^\[[Pp][Ee][Ee][Rr]\][[:space:]]*(#.*)?$/[Peer]/' "$cfg"
 
     if grep -qiE '^DNS[[:space:]]*=' "$cfg"; then
         sed -i -E '/^[Dd][Nn][Ss][[:space:]]*=/d' "$cfg"
@@ -426,6 +450,12 @@ sanitize_config() {
         sed -i -E '/^\[[Ii]nterface\]/a Table = off' "$cfg"
         SANITIZE_NOTES+=("Set 'Table = off' (keeps SSH and server traffic out of the tunnel)")
     fi
+    # بدون Table = off، wg-quick کل ترافیک سرور رو میبره توی تونل (SSH قطع میشه)
+    if ! grep -qiE '^Table[[:space:]]*=[[:space:]]*off[[:space:]]*$' "$cfg"; then
+        err "Could not set 'Table = off' in $cfg (no [Interface] section?)"
+        chmod 600 "$cfg"
+        return 1
+    fi
     # آدرس IPv6 دیگه از کانفیگ ذخیره‌شده پاک نمیشه — runtime_config رو ببین
     chmod 600 "$cfg"
 }
@@ -439,7 +469,7 @@ runtime_config() {
     mkdir -p "$RUN_DIR" && chmod 700 "$RUN_DIR" || return 1
     install -m 600 "$(cfg_path "$name")" "$RT_CFG" || return 1
 
-    sanitize_config "$RT_CFG"
+    sanitize_config "$RT_CFG" || return 1
     for n in "${SANITIZE_NOTES[@]}"; do note "$name: $n (runtime only)"; done
 
     # keepalive باعث میشه handshake همیشه تازه بمونه → سلامت تونل قابل اعتماد چک میشه
@@ -919,7 +949,11 @@ fmt_bytes() {
     fi
 }
 
-latest_handshake() { wg show "$1" latest-handshakes 2>/dev/null | awk 'NR==1 {print $2}'; }
+latest_handshake() {   # همیشه یه عدد (0 = هیچ‌وقت / تونل نیست)
+    local v
+    v=$(wg show "$1" latest-handshakes 2>/dev/null | awk 'NR==1 && $2 ~ /^[0-9]+$/ {print $2}')
+    echo "${v:-0}"
+}
 
 # handshake تازه‌ست؟ اگه نه، ترافیک بفرست و تا ۸ ثانیه صبر کن (WireGuard هر ۵ ثانیه دوباره تلاش میکنه)
 handshake_fresh() {
@@ -940,7 +974,7 @@ handshake_fresh() {
 # نمیکنه — پس هیچ‌وقت leak رو نشون نمیداد)
 # خروجی: ip country city mullvad(yes/no/?) src با tab؛ فیلد خالی = "-"
 PY_EXIT='
-import json, socket, ssl, sys
+import json, re, socket, ssl, sys
 mark, fam = int(sys.argv[1]), sys.argv[2]
 af = socket.AF_INET6 if fam == "6" else socket.AF_INET
 def get(host, path):
@@ -962,7 +996,7 @@ def get(host, path):
     t.close()
     return src, json.loads(data.split(b"\r\n\r\n", 1)[1].decode())
 def f(v):
-    v = str(v or "-").replace("\t", " ").strip()
+    v = re.sub(r"[\x00-\x1f\x7f]", " ", str(v or "-")).strip()   # بدون کاراکتر کنترلی (escape ترمینال)
     return v or "-"
 try:
     try:
@@ -1031,9 +1065,9 @@ mtu_probe() {
 with_spin() {
     local txt="$1" rc
     shift
-    [ "$TL_MODE" = full ] && spin_start "$txt"
-    "$@"; rc=$?
-    spin_stop
+    # فقط spinner خودش رو متوقف میکنه (توی test all، spinner بیرونی روشن میمونه)
+    if [ "$TL_MODE" = full ]; then spin_start "$txt"; "$@"; rc=$?; spin_stop
+    else "$@"; rc=$?; fi
     return $rc
 }
 
@@ -1292,7 +1326,7 @@ logo_build() {   # رنگ‌ها: ابر آبی، خط‌های وسط سفید�
 show_logo() { [ "${WGM_LOGO:-1}" = 1 ] && [ "$(term_cols)" -ge 34 ]; }
 
 # ── اسم Mullvad → محل ───────────────────────────
-# de-fra-wg-203 → "DE Frankfurt". پرچم فقط با WGM_FLAGS=1 (خیلی از ترمینال‌ها مثل
+# de-fra-wg-203 → "DE Frankfurt". پرچم پیش‌فرض روشنه؛ WGM_FLAGS=0 خاموشش میکنه (بعضی ترمینال‌ها مثل
 # Windows Terminal/PuTTY/tmux پرچم رو درست نشون نمیدن و ستون‌ها رو به هم میریزن)
 mullvad_city() {
     case "$1" in
@@ -1797,10 +1831,15 @@ resolve_targets() {
         return 0
     fi
     if [[ "$given" == *,* ]]; then
-        for part in ${given//,/ }; do
+        local parts=()
+        IFS=',' read -ra parts <<< "$given"      # بدون glob: "*" اسم فایل‌ها نمیشه
+        for part in "${parts[@]}"; do
+            part=$(trim "$part")
+            [ -n "$part" ] || continue
             resolve_target one "$filter" "$part" || return 1
-            TARGETS+=("$one")
+            [[ " ${TARGETS[*]} " == *" $one "* ]] || TARGETS+=("$one")
         done
+        [ ${#TARGETS[@]} -gt 0 ] || { err "No tunnel given"; return 1; }
         return 0
     fi
     resolve_target one "$filter" "$given" || return 1
@@ -1931,7 +1970,7 @@ _add() {
             ;;
     esac
 
-    sanitize_config "$tmp"
+    sanitize_config "$tmp" || return 1
     if ! check_config "$tmp"; then
         note "Nothing was saved."
         return 1
@@ -1995,18 +2034,31 @@ quick_check() {
 }
 
 # enable / disable / restart قبول میکنن: اسم، شماره، بخشی از اسم، "1,3" ، و (restart) "all"
+# قفل فقط موقع کار گرفته میشه، نه موقع انتخاب تونل (وگرنه watchdog منتظر جواب کاربر میمونه)
+# و تست کامل (تا یه دقیقه) بعد از آزاد کردن قفل اجرا میشه
+after_action_check() {   # after_action_check <names...>
+    local name
+    for name in "$@"; do
+        if [ $# -eq 1 ] && [ "${NO_TEST:-}" != 1 ]; then test_tunnel "$name"; else quick_check "$name"; fi
+    done
+}
+
 cmd_enable() {
-    local name rc=0
+    local name rc=0 done_names=()
     header "Enable Tunnel"
     resolve_targets startable "$1" || return 1
+    lock || return 1
     for name in "${TARGETS[@]}"; do
+        [ -f "$(cfg_path "$name")" ] || { err "$name no longer exists"; rc=1; continue; }
         meta_set "$(cfg_path "$name")" Enabled yes
         if ! tunnel_up "$name"; then rc=1; continue; fi
         # اتصال‌هایی که وقتی تونل پایین بود از IP سرور رفتن بسته میشن تا از تونل وصل بشن
         flush_conntrack_mark "$(tunnel_mark "$name")"
         ok "$name will also start after reboot"
-        if [ ${#TARGETS[@]} -eq 1 ] && [ "${NO_TEST:-}" != 1 ]; then test_tunnel "$name"; else quick_check "$name"; fi
+        done_names+=("$name")
     done
+    unlock
+    after_action_check "${done_names[@]}"
     return $rc
 }
 
@@ -2014,7 +2066,9 @@ cmd_disable() {
     local name t rc=0
     header "Disable Tunnel"
     resolve_targets stoppable "$1" || return 1
+    lock || return 1
     for name in "${TARGETS[@]}"; do
+        [ -f "$(cfg_path "$name")" ] || { err "$name no longer exists"; rc=1; continue; }
         t=$(tunnel_mark "$name")
         meta_set "$(cfg_path "$name")" Enabled no
         tunnel_stop "$name" || { rc=1; continue; }
@@ -2022,19 +2076,33 @@ cmd_disable() {
         [[ "$t" =~ ^[0-9]+$ ]] && warn "Xray outbounds with mark $t now exit via the server IP"
         log_file "$name disabled"
     done
+    unlock
     return $rc
 }
 
+# تونل‌هایی که عمداً خاموش شدن (disable) با restart روشن نمیشن — برای اونا enable هست
 cmd_restart() {
-    local name rc=0
+    local name rc=0 done_names=() list=()
     header "Restart Tunnel"
     PICK_ALLOW_ALL=1 resolve_targets all "$1" || return 1
     [ "${TARGETS[0]}" = all ] && { resolve_targets all all || return 1; }
     for name in "${TARGETS[@]}"; do
+        if ! is_enabled "$name" && ! is_up "$name"; then
+            note "$name is turned off — skipped (use 'enable $name' to turn it on)"
+            continue
+        fi
+        list+=("$name")
+    done
+    [ ${#list[@]} -gt 0 ] || { warn "Nothing to restart"; return 1; }
+    lock || return 1
+    for name in "${list[@]}"; do
+        [ -f "$(cfg_path "$name")" ] || { err "$name no longer exists"; rc=1; continue; }
         if ! tunnel_up "$name"; then rc=1; continue; fi
         flush_conntrack_mark "$(tunnel_mark "$name")"
-        if [ ${#TARGETS[@]} -eq 1 ] && [ "${NO_TEST:-}" != 1 ]; then test_tunnel "$name"; else quick_check "$name"; fi
+        done_names+=("$name")
     done
+    unlock
+    after_action_check "${done_names[@]}"
     return $rc
 }
 
@@ -2062,7 +2130,7 @@ backup_save() {
     base="$BACKUP_DIR/$2.conf.$(date +%Y%m%d%H%M%S)"
     dest="$base"
     while [ -e "$dest" ]; do dest="$base.$i"; i=$((i + 1)); done
-    cp "$1" "$dest"
+    mkdir -p "$BACKUP_DIR" && cp "$1" "$dest"
 }
 
 # فقط BACKUP_KEEP نسخه آخر هر تونل توی پوشه بکاپ میمونه (هر کدوم کلید خصوصی دارن)
@@ -2099,7 +2167,7 @@ cmd_edit() {
             ok "No changes"
             return 0
         fi
-        sanitize_config "$tmp"
+        sanitize_config "$tmp" || { unlock; err "Nothing saved"; return 1; }
         t=$(meta_get "$tmp" Table-ID)
         if check_config "$tmp" && TABLE_SELF="$name" v_table "$t"; then
             break
@@ -2117,14 +2185,18 @@ cmd_edit() {
         err "$name was changed by something else while you were editing — nothing saved"
         return 1
     fi
+    # mark ممکنه وسط ویرایش توسط یه تونل دیگه (add/import) گرفته شده باشه
+    if ! TABLE_SELF="$name" v_table "$t"; then unlock; err "Nothing saved"; return 1; fi
 
     was_up=0
     is_up "$name" && was_up=1
     [ "$was_up" = 1 ] && tunnel_stop "$name" >/dev/null   # با table قدیمی پاک کن
     # mark عوض شده → شمارنده leak قدیمی دیگه معنی نداره
+    if ! backup_save "$cfg" "$name"; then
+        [ "$was_up" = 1 ] && tunnel_up "$name" >/dev/null
+        unlock; err "Could not back up the current version (disk full?) — nothing saved"; return 1
+    fi
     [[ "$old_t" =~ ^[0-9]+$ ]] && [ "$old_t" != "$t" ] && leak_rules_del "$name" "$old_t"
-
-    backup_save "$cfg" "$name"
     prune_backups "$name"
     install -m 600 "$tmp" "$cfg"
     ok "Saved ${DIM}(previous version in $BACKUP_DIR)${NC}"
@@ -2166,10 +2238,14 @@ cmd_delete() {
     [[ "$t" =~ ^[0-9]+$ ]] && leak_rules_del "$name" "$t"
 
     dest="$BACKUP_DIR/$name.conf.deleted.$(date +%Y%m%d%H%M%S)"
-    mv "$cfg" "$dest"
+    if ! mv "$cfg" "$dest"; then unlock; err "Could not move the config to $BACKUP_DIR — not deleted"; return 1; fi
     prune_backups "$name"
-    systemctl disable "wg-quick@$name" &>/dev/null
-    [ -f "/etc/wireguard/$name.conf" ] && mv "/etc/wireguard/$name.conf" "$dest.etc"
+    # فقط کپی قدیمی خود همین تونل (همون کلید)، نه یه کانفیگ دیگه که اتفاقاً همین اسم رو داره
+    if [ -f "/etc/wireguard/$name.conf" ] && \
+       [ "$(conf_get "/etc/wireguard/$name.conf" PrivateKey)" = "$(conf_get "$dest" PrivateKey)" ]; then
+        mv "/etc/wireguard/$name.conf" "$dest.etc"
+        systemctl disable "wg-quick@$name" &>/dev/null
+    fi
     rm -f "$STATE_DIR/test-$name" 2>/dev/null
     unlock
     ok "$name deleted ${DIM}(backup: $dest)${NC}"
@@ -2280,9 +2356,9 @@ fix_sysctl_all_v6() {
     for f in $(sysctl_all_v6_files); do
         case "$f" in
             /etc/*)
-                cp "$f" "$BACKUP_DIR/$(basename "$f").$(date +%Y%m%d%H%M%S)"
+                mkdir -p "$BACKUP_DIR/sysctl" && cp "$f" "$BACKUP_DIR/sysctl/$(basename "$f").$(date +%Y%m%d%H%M%S)"
                 if sed -i -E 's@^([[:space:]]*net[./]ipv6[./]conf[./]all[./]disable_ipv6[[:space:]]*=)@# disabled by wg-manager: \1@' "$f"; then
-                    ok "Commented out all.disable_ipv6 in $f ${DIM}(backup in $BACKUP_DIR)${NC}"
+                    ok "Commented out all.disable_ipv6 in $f ${DIM}(backup in $BACKUP_DIR/sysctl)${NC}"
                     log_file "sysctl: commented out all.disable_ipv6 in $f"
                 else
                     err "Could not edit $f"; rc=1
@@ -2473,8 +2549,13 @@ cmd_doctor() {
         # همه با هم → مشکل از تونل‌ها نیست؛ ری‌استارت فقط leak کوتاه پشت سر هم میسازه
         d_bad "All ${#up[@]} tunnels have no handshake — usually the Mullvad account/key, DNS or this server's internet, not the tunnels"
         if [ "$DOC_FIX" = 1 ]; then
-            for n in "${still[@]}"; do peer_reset "$n"; done
-            d_fail "not restarting the tunnels (it would not help) — check the Mullvad account and the server's network"
+            local back=0
+            for n in "${still[@]}"; do peer_reset "$n" && handshake_fresh "$n" && back=$((back + 1)); done
+            if [ "$back" -eq ${#still[@]} ]; then
+                d_fixed "handshakes are back after re-setting the peers"
+            else
+                d_fail "not restarting the tunnels (it would not help) — check the Mullvad account and the server's network"
+            fi
         fi
     else
         for n in "${still[@]}"; do
@@ -2662,7 +2743,9 @@ cmd_backup() {
     local out="${1:-}" stage dir n count=0
     header "Backup"
     if [ -z "$(list_tunnels)" ]; then warn "No tunnels to back up"; return 1; fi
-    [ -n "$out" ] || out="/root/wg-manager-backup-$(hostname -s 2>/dev/null || echo server)-$(date +%Y%m%d-%H%M%S).tar.gz"
+    local def_name="wg-manager-backup-$(hostname -s 2>/dev/null || echo server)-$(date +%Y%m%d-%H%M%S).tar.gz"
+    [ -n "$out" ] || out="/root/$def_name"
+    [ -d "$out" ] && out="${out%/}/$def_name"      # پوشه داده شده → فایل توی همون پوشه
     case "$out" in
         /tmp/*|/var/tmp/*) warn "This file holds private keys — /tmp is not a good place for it (use /root)" ;;
     esac
@@ -2688,11 +2771,15 @@ cmd_backup() {
 }
 
 cmd_restore() {
-    local file="${1:-}" listing line kind path stage dir f n t cfg action i was_up old_t
-    local names=() actions=() marks=() start=() taken=" " count=0
+    local file="${1:-}" file_src listing line kind path stage dir f n t cfg action i old_t
+    local names=() actions=() marks=() start=() was_up=() new_names=() taken=" " count=0
     header "Restore"
     if [ -z "$file" ]; then prompt file "Path to backup file (.tar.gz)" || return 1; fi
     [ -f "$file" ] || { err "File not found: $file"; return 1; }
+    # اول یه کپی خصوصی: چک و استخراج روی همون یه فایل (کسی نمیتونه وسط کار عوضش کنه)
+    new_tmp stage dir || { err "Could not create a temp dir in $RUN_DIR"; return 1; }
+    cp -- "$file" "$stage/backup.tgz" 2>/dev/null && chmod 600 "$stage/backup.tgz" || { err "Could not read $file"; return 1; }
+    file_src="$file"; file="$stage/backup.tgz"
 
     # فقط فایل معمولی wg-manager-backup/<name>.conf و MANIFEST قبوله
     # (بدون symlink، بدون ../، بدون مسیر مطلق — فایل دستکاری‌شده نمیتونه جای دیگه‌ای بنویسه)
@@ -2710,7 +2797,6 @@ cmd_restore() {
         return 1
     done <<< "$listing"
 
-    new_tmp stage dir || { err "Could not create a temp dir in $RUN_DIR"; return 1; }
     tar -C "$stage" -xzf "$file" --no-same-owner --no-same-permissions wg-manager-backup 2>/dev/null \
         || { err "Could not extract $file"; return 1; }
     dir="$stage/wg-manager-backup"
@@ -2718,9 +2804,10 @@ cmd_restore() {
 
     # برنامه: new / replace / same — mark تکراری یا نامعتبر → mark جدید
     for f in "$dir"/*.conf; do
-        [ -f "$f" ] || continue
+        [ -f "$f" ] && [ ! -L "$f" ] || continue
         n=$(basename "$f" .conf)
-        sanitize_config "$f"            # PostUp/DNS/... از یه فایل دستکاری‌شده هم پاک میشن
+        if [ "$n" = all ] || [[ "$n" =~ ^[0-9]+$ ]] || [[ "$n" == *+ ]]; then warn "$n: not a usable tunnel name — skipped"; continue; fi
+        sanitize_config "$f" 2>/dev/null || { warn "$n: not a usable config — skipped"; continue; }   # PostUp/DNS/... هم پاک میشن
         if ! check_config "$f" 2>/dev/null; then warn "$n: incomplete config — skipped"; continue; fi
         cfg=$(cfg_path "$n")
         if [ -f "$cfg" ]; then
@@ -2763,26 +2850,53 @@ cmd_restore() {
         [ -n "$(meta_get "$f" Enabled)" ] || meta_set "$f" Enabled yes
         if [ -f "$cfg" ]; then
             old_t=$(meta_get "$cfg" Table-ID)
-            is_up "$n" && tunnel_stop "$n" >/dev/null       # با table قدیمی پاک بشه
+            if is_up "$n"; then
+                was_up+=("$n")
+                tunnel_stop "$n" >/dev/null       # با table قدیمی پاک بشه
+            fi
             [[ "$old_t" =~ ^[0-9]+$ ]] && [ "$old_t" != "$t" ] && leak_rules_del "$n" "$old_t"
-            backup_save "$cfg" "$n"
+            backup_save "$cfg" "$n" || { err "$n: backup of the current config failed — not replaced"; continue; }
             prune_backups "$n"
         fi
+        [ -f "$cfg" ] || new_names+=("$n")
         install -m 600 "$f" "$cfg"
         count=$((count + 1))
         [ "$(meta_get "$cfg" Enabled)" != no ] && start+=("$n")
     done
+    # تونل‌هایی که قبل از restore روشن بودن همین الان دوباره بالا میان (حتی اگه بعداً «نه» بگی)
+    for n in "${was_up[@]}"; do
+        tunnel_up "$n" >/dev/null && flush_conntrack_mark "$(tunnel_mark "$n")"
+    done
     unlock
     ok "Restored $count tunnel(s)"
-    log_file "restore: $count tunnels from $file"
+    log_file "restore: $count tunnels from $file_src"
 
-    if [ ${#start[@]} -gt 0 ] && confirm "Start the enabled ones now? (${start[*]})" y; then
+    local rest=()
+    for n in "${start[@]}"; do
+        [[ " ${was_up[*]} " == *" $n "* ]] && continue          # همین الان دوباره بالا اومد
+        is_up "$n" && routing_ok_quick "$n" "$(tunnel_mark "$n")" && continue   # از قبل روشن و سالم
+        rest+=("$n")
+    done
+    if [ ${#rest[@]} -gt 0 ] && confirm "Start the enabled ones now? (${rest[*]})" y; then
         lock || return 1
-        for n in "${start[@]}"; do
+        for n in "${rest[@]}"; do
             if is_up "$n" && routing_ok_quick "$n" "$(tunnel_mark "$n")"; then continue; fi
             tunnel_up "$n" && flush_conntrack_mark "$(tunnel_mark "$n")"
         done
         unlock
+    elif [ ${#rest[@]} -gt 0 ]; then
+        # «نه» برای تونل‌های تازه‌اضافه‌شده یعنی خاموش (وگرنه watchdog خودش روشنشون میکرد).
+        # تونل‌هایی که از قبل بودن دست نمیخورن
+        local off=()
+        lock || return 1
+        for n in "${rest[@]}"; do
+            [[ " ${new_names[*]} " == *" $n "* ]] || continue
+            is_up "$n" && continue
+            meta_set "$(cfg_path "$n")" Enabled no
+            off+=("$n")
+        done
+        unlock
+        [ ${#off[@]} -gt 0 ] && ok "Kept off: ${off[*]} — turn them on with o<#> in the menu"
     fi
     [ -f "$SERVICE_FILE" ] || warn "Auto-start + watchdog are not installed on this server — run: wg-manager install"
 }
@@ -2824,17 +2938,22 @@ bulk_name() {
         s/\.prod\.surfshark\.com//
         s/[-_ ](wg|wireguard|udp)$//
         s/[^a-z0-9_=+.-]+/-/g; s/-+/-/g; s/^[-.=+]+//; s/[-.]+$//' | cut -c1-15 | sed -E 's/[-.=+]+$//')
-    [ -n "$n" ] && [[ "$n" =~ $NAME_RE ]] || return 1
+    [ -n "$n" ] || return 1
+    # "all" و عدد خالی با دستورها/شماره ردیف قاطی میشن → "vpn-..."
+    if [ "$n" = all ] || [[ "$n" =~ ^[0-9]+$ ]]; then n="vpn-$n"; n="${n:0:15}"; fi
+    [[ "$n" =~ $NAME_RE ]] && [[ "$n" != *+ ]] || return 1
     echo "$n"
 }
 
 # انتخاب: "all" · "de" (کشور) · "de-fra" (شهر) · اسم کامل · چندتا با کاما
 bulk_select() {   # bulk_select <filter> <names...> → اسم‌های انتخاب‌شده (هر کدوم یه خط)
-    local filter="$1" n tok
+    local filter="$1" n tok toks=()
     shift
     for n in "$@"; do
         if [ "$filter" = all ]; then echo "$n"; continue; fi
-        for tok in ${filter//,/ }; do
+        IFS=', ' read -ra toks <<< "$filter"
+        for tok in "${toks[@]}"; do
+            [ -n "$tok" ] || continue
             if [ "$n" = "$tok" ] || [[ "$n" == "$tok"-* ]]; then echo "$n"; break; fi
         done
     done
@@ -2855,7 +2974,8 @@ cmd_import_bulk() {
         while IFS= read -r -d '' f; do
             case "$(basename "$f")" in ._*) continue ;; esac
             i=$((i + 1))
-            cp "$f" "$stage/raw/$i" 2>/dev/null && printf '%s\t%s\n' "$i" "$(basename "$f" | tr '\t' ' ')" >> "$stage/list"
+            base=$(basename "$f"); base=${base//$'\t'/ }; base=${base//$'\n'/ }
+            cp "$f" "$stage/raw/$i" 2>/dev/null && printf '%s\t%s\n' "$i" "$base" >> "$stage/list"
         done < <(find "$src" -maxdepth 4 -type f \( -iname '*.conf' -o -iname '*.txt' \) -size -64k -print0 2>/dev/null)
     elif [ -f "$src" ] && [[ "$src" == *.[Zz][Ii][Pp] ]]; then
         command -v python3 &>/dev/null || { err "python3 is needed to read zip files"; return 1; }
@@ -2868,8 +2988,9 @@ cmd_import_bulk() {
     # ۲) فقط کانفیگ‌های WireGuard → out/<اسم تونل>.conf
     #    دو فایل با یه اسم → دومی "-2" میگیره (هیچ‌کدوم جای اون یکی رو نمیگیره)؛ فایل تکراری عیناً → یه بار
     while IFS=$'\t' read -r id orig; do
+        [[ "$id" =~ ^[0-9]+$ ]] || continue
         f="$stage/raw/$id"
-        [ -f "$f" ] || continue
+        [ -f "$f" ] && [ ! -L "$f" ] || continue
         grep -qiE '^[[:space:]]*\[interface\]' "$f" 2>/dev/null || continue
         # همون فایل دوبار (مثلاً "x.conf" و "x copy.conf") → یه بار
         sum=$(cksum < "$f" | awk '{print $1 "-" $2}')
@@ -2888,7 +3009,8 @@ cmd_import_bulk() {
         if [ "$n" != "$base" ]; then
             note "'$orig' → $n (the name $base was already taken by another file)"
         fi
-    done < "$stage/list"
+    done < <(awk -F'\t' '{ k = $2; sub(/\.[^.]*$/, "", k); print k "\t" $0 }' "$stage/list" | LC_ALL=C sort -t$'\t' -k1,1 | cut -f2-)
+    # ↑ ترتیب ثابت بر اساس اسم (بدون پسوند): "-2" همیشه به همون فایل میرسه و "x" قبل از "x copy" میاد
     stage="$stage/out"
     for f in "$stage"/*.conf; do [ -f "$f" ] && names+=("$(basename "$f" .conf)"); done   # glob = مرتب
     total=${#names[@]}
@@ -2913,7 +3035,7 @@ cmd_import_bulk() {
     # برنامه
     for n in "${sel[@]}"; do
         f="$stage/$n.conf"
-        sanitize_config "$f"
+        sanitize_config "$f" 2>/dev/null || { warn "$n: not a usable config — skipped"; continue; }
         if ! check_config "$f" 2>/dev/null; then warn "$n: incomplete config — skipped"; continue; fi
         if [ -f "$(cfg_path "$n")" ]; then
             # فقط محتوای WireGuard مقایسه میشه (متادیتای ما توی فایل جدید نیست)
@@ -2946,6 +3068,14 @@ cmd_import_bulk() {
     done
     echo ""
     confirm "Apply?" y || { warn "Cancelled — nothing changed"; return 1; }
+    # قبل از نوشتن پرسیده میشه: اگه بعداً پرسیده میشد، watchdog وسط سؤال تونل‌های جدید
+    # (که enable ذخیره شده بودن) رو روشن میکرد و «نه» دیگه اثری نداشت
+    local start_new=0 has_new=0
+    for i in "${!actions[@]}"; do [ "${actions[$i]}" = new ] && has_new=1; done
+    if [ "$has_new" = 1 ]; then
+        note "y = start the new tunnels now · n = keep them off (turn each on later with o<#> in the menu)"
+        confirm "Start the new tunnels now?" y && start_new=1
+    fi
 
     lock || return 1
     for i in "${!names_plan[@]}"; do
@@ -2953,43 +3083,32 @@ cmd_import_bulk() {
         case "${actions[$i]}" in
             same) continue ;;
             update)
+                [[ "${marks[$i]}" =~ ^[1-9][0-9]*$ ]] || marks[$i]=$(free_table "$taken")
+                [ -n "${marks[$i]}" ] || { warn "$n: no valid mark — skipped"; continue; }
                 meta_set "$f" Table-ID "${marks[$i]}"
                 old_en=$(meta_get "$(cfg_path "$n")" Enabled)
                 meta_set "$f" Enabled "${old_en:-yes}"
-                backup_save "$(cfg_path "$n")" "$n"
+                backup_save "$(cfg_path "$n")" "$n" || { err "$n: backup of the current config failed — not updated"; continue; }
                 prune_backups "$n"
                 is_up "$n" && start+=("$n")
                 ;;
             new)
                 meta_set "$f" Table-ID "${marks[$i]}"
-                meta_set "$f" Enabled yes
-                start+=("$n")
+                if [ "$start_new" = 1 ]; then meta_set "$f" Enabled yes; start+=("$n")
+                else meta_set "$f" Enabled no; fi
                 ;;
         esac
-        install -m 600 "$f" "$(cfg_path "$n")"
+        if ! install -m 600 "$f" "$(cfg_path "$n")"; then err "$n: could not write the config"; continue; fi
         count=$((count + 1))
         log_file "import: $n ${actions[$i]} (mark ${marks[$i]})"
     done
-    unlock
     ok "Imported $count tunnel(s)"
-
-    if [ ${#start[@]} -gt 0 ]; then
-        echo ""
-        note "y = start them now · n = keep the new ones off (turn each on later with o<#> in the menu)"
-        if confirm "Start / restart them now? (${start[*]})" y; then
-            lock || return 1
-            for n in "${start[@]}"; do
-                tunnel_up "$n" && flush_conntrack_mark "$(tunnel_mark "$n")"
-            done
-            unlock
-        else
-            # جدیدها خاموش میمونن (وگرنه watchdog چند دقیقه بعد خودش روشنشون میکرد)
-            for i in "${!names_plan[@]}"; do
-                [ "${actions[$i]}" = new ] && meta_set "$(cfg_path "${names_plan[$i]}")" Enabled no
-            done
-            ok "New tunnels are saved but off — turn them on with o<#> in the menu"
-        fi
-    fi
+    # تونل‌های جدید (اگه گفتی آره) + تونل‌های روشنی که آپدیت شدن (تا کانفیگ جدید اعمال بشه)
+    for n in "${start[@]}"; do
+        tunnel_up "$n" && flush_conntrack_mark "$(tunnel_mark "$n")"
+    done
+    unlock
+    [ "$has_new" = 1 ] && [ "$start_new" = 0 ] && ok "New tunnels are saved but off — turn them on with o<#> in the menu"
 
     # mark های جدید برای Xray
     for i in "${!names_plan[@]}"; do
@@ -3078,9 +3197,13 @@ cmd_rollback() {
     # diff (کلید خصوصی مخفی)
     echo ""
     if [ -f "$cfg" ]; then
-        if diff -q <(masked_conf "$cfg") <(masked_conf "$pick") >/dev/null 2>&1; then
+        # مقایسه روی فایل واقعی (فقط فرق کلید خصوصی هم فرقه)؛ diff نمایشی کلید رو مخفی میکنه
+        if cmp -s "$cfg" "$pick"; then
             ok "That version is the same as the current one — nothing to do"
             return 0
+        fi
+        if diff -q <(masked_conf "$cfg") <(masked_conf "$pick") >/dev/null 2>&1; then
+            note "Only the PrivateKey differs (hidden here)"
         fi
         diff -u --label "current" --label "version from $(backup_when "$pick")" <(masked_conf "$cfg") <(masked_conf "$pick") | \
             while IFS= read -r line; do
@@ -3101,7 +3224,7 @@ cmd_rollback() {
 
     new_tmp tmp || return 1
     cp "$pick" "$tmp"
-    sanitize_config "$tmp"
+    sanitize_config "$tmp" || { err "That version is not a usable config — not restored"; return 1; }
     check_config "$tmp" || { err "That version is not a complete config — not restored"; return 1; }
     t=$(meta_get "$tmp" Table-ID)
     if ! [[ "$t" =~ ^[0-9]+$ ]] || ! TABLE_SELF="$name" v_table "$t" 2>/dev/null; then
@@ -3113,6 +3236,12 @@ cmd_rollback() {
     [ -n "$(meta_get "$tmp" Enabled)" ] || meta_set "$tmp" Enabled yes
 
     lock || return 1
+    # تونل حذف‌شده، ولی یه اینترفیس دیگه با همین اسم هست → دست نمیزنیم (tunnel_up پاکش میکرد)
+    if [ ! -f "$cfg" ] && ip link show "$name" &>/dev/null; then
+        unlock
+        err "A network interface named '$name' already exists (not managed here) — not restored"
+        return 1
+    fi
     was_up=0
     is_up "$name" && was_up=1
     if [ -f "$cfg" ]; then
@@ -3120,7 +3249,10 @@ cmd_rollback() {
         [ "$was_up" = 1 ] && tunnel_stop "$name" >/dev/null
         [[ "$cur_t" =~ ^[0-9]+$ ]] && [ "$cur_t" != "$t" ] && leak_rules_del "$name" "$cur_t"
         # نسخه فعلی هم نگه داشته میشه → خود rollback هم قابل برگشته
-        backup_save "$cfg" "$name"
+        if ! backup_save "$cfg" "$name"; then
+            [ "$was_up" = 1 ] && tunnel_up "$name" >/dev/null
+            unlock; err "Could not back up the current version — nothing changed"; return 1
+        fi
         prune_backups "$name"
     fi
     install -m 600 "$tmp" "$cfg"
@@ -3390,8 +3522,9 @@ watchdog_lock() {
     if [ "$n" -ge 3 ]; then
         rm -f "$f"
         log_file "watchdog: another wg-manager has been busy for $n checks — waiting for it"
-        lock
-        return
+        lock && return 0
+        log_file "watchdog: ERROR — still locked after waiting; no repairs are running (is a wg-manager stuck? see: fuser -v $LOCK_FILE)"
+        return 1
     fi
     mkdir -p "$RUN_DIR" && echo "$n" > "$f"
     log_file "watchdog: skipped this check (another wg-manager is running)"
@@ -3432,7 +3565,7 @@ Usage: wg-manager [command] [tunnel] [options]
   down-all              stop all tunnels (temporary; pauses the watchdog)
   install               install/upgrade: $INSTALL_PATH + boot service + watchdog
 
-  -y, --yes             accept defaults, don't ask
+  -y, --yes             answer yes / accept defaults, don't ask (also for delete!)
   -v, --verbose         more detail (status)
   -q, --quiet           only print problems (doctor)
   --fix                 repair what doctor finds
@@ -3592,7 +3725,7 @@ run_action() {
     local kind="$1"
     shift
     MENU_IDLE=0
-    ( trap cleanup EXIT; trap 'echo ""; exit 130' INT TERM; "$@" )
+    ( trap cleanup EXIT; trap 'echo ""; exit 130' INT TERM HUP; "$@" )
     ACTION_RC=$?
     MENU_IDLE=1
     if [ "$ACTION_RC" = 130 ]; then
@@ -3606,9 +3739,9 @@ run_action() {
 toggle_tunnel() {
     local n="$1"
     if is_enabled "$n" && is_up "$n"; then
-        NO_TEST=1 run_locked cmd_disable "$n"
+        NO_TEST=1 cmd_disable "$n"
     else
-        NO_TEST=1 run_locked cmd_enable "$n"
+        NO_TEST=1 cmd_enable "$n"
     fi
 }
 
@@ -3624,14 +3757,24 @@ tunnel_action() {   # tunnel_action <key> <targets>
     # برای پیام: شماره → اسم
     match_tunnel one "$tg" >/dev/null 2>&1 && label="$one"
     case "$key" in
-        r)  run_action quick env_no_test run_locked cmd_restart "$tg"
+        r)  run_action quick env_no_test cmd_restart "$tg"
             [ "$ACTION_RC" = 0 ] && TOAST="${GREEN}✓ restarted: $label${NC}" ;;
         t)  run_action long cmd_test "$tg" ;;
         e)  resolve_target one all "$tg" >/dev/null 2>&1 || { TOAST="${RED}✗ no tunnel '$tg'${NC}"; return; }
             run_action long cmd_edit "$one" ;;
         o)  resolve_targets all "$tg" 2>/dev/null || { TOAST="${RED}✗ no tunnel '$tg'${NC}"; return; }
-            for one in "${TARGETS[@]}"; do run_action quick toggle_tunnel "$one"; done
-            [ "$ACTION_RC" = 0 ] && TOAST="${GREEN}✓ turned on/off: ${TARGETS[*]}${NC}" ;;
+            if [ ${#TARGETS[@]} -gt 1 ]; then
+                echo ""
+                confirm "Turn on/off ${#TARGETS[@]} tunnels (${TARGETS[*]})? Off ones exit via the server IP" n || return
+            fi
+            local failed=()
+            for one in "${TARGETS[@]}"; do
+                run_action quick toggle_tunnel "$one"
+                [ "$ACTION_RC" = 130 ] && return          # Ctrl+C → بقیه دست نمیخورن
+                [ "$ACTION_RC" = 0 ] || failed+=("$one")
+            done
+            if [ ${#failed[@]} -eq 0 ]; then TOAST="${GREEN}✓ turned on/off: ${TARGETS[*]}${NC}"
+            else TOAST="${RED}✗ failed: ${failed[*]}${NC}"; fi ;;
         x)  resolve_target one all "$tg" >/dev/null 2>&1 || { TOAST="${RED}✗ no tunnel '$tg'${NC}"; return; }
             run_action long print_xray_hint "$one" "$(tunnel_mark "$one")" ;;
         *)  TOAST="${RED}✗ unknown key '$key' — press ? for help${NC}" ;;
@@ -3747,11 +3890,11 @@ tunnel_menu() {
         if [ -n "$TOAST" ]; then echo ""; echo -e "  $TOAST"; TOAST=""; fi
         echo ""
         read -r -p "$(printf '  %b?%b %s: ' "$BLUE" "$NC" "$name")" c
-        [ $? -gt 128 ] && return            # Ctrl+C → برگشت
+        [ $? -ne 0 ] && return              # Ctrl+D → برگشت (Ctrl+C از هر صفحه‌ای برنامه رو میبنده)
         c=$(trim "$c")
         case "$c" in
             "")        return ;;
-            r)         run_action quick env_no_test run_locked cmd_restart "$name"
+            r)         run_action quick env_no_test cmd_restart "$name"
                        [ "$ACTION_RC" = 0 ] && TOAST="${GREEN}✓ restarted${NC}" ;;
             t)         run_action long cmd_test "$name" ;;
             e)         run_action long cmd_edit "$name"; [ -f "$(cfg_path "$name")" ] || return ;;
@@ -3807,11 +3950,11 @@ palette_run() {
                   tg=$( ( trap 'exit 130' INT; pick_tunnel tg all >&2 && echo "$tg" ) )
                   MENU_IDLE=1
                   [ -n "$tg" ] && tunnel_menu "$tg" ;;
-        restart)  run_action long run_locked cmd_restart ;;
+        restart)  run_action long cmd_restart ;;
         test)     run_action long cmd_test ;;
         test-all) run_action long cmd_test all ;;
-        enable)   run_action long run_locked cmd_enable ;;
-        disable)  run_action long run_locked cmd_disable ;;
+        enable)   run_action long cmd_enable ;;
+        disable)  run_action long cmd_disable ;;
         edit)     run_action long cmd_edit ;;
         xray)     run_action long xray_pick ;;
         rollback) run_action long cmd_rollback ;;
@@ -3837,11 +3980,13 @@ palette_filter() {
     local q e key label words id hay w ok
     q=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
     PAL_HITS=()
+    local qw=()
+    read -ra qw <<< "$q"                     # بدون glob: "?" یا "*" اسم فایل نمیشن
     for e in "${PALETTE[@]}"; do
         IFS='|' read -r key label words id <<< "$e"
         hay=$(printf '%s %s %s' "$key" "$label" "$words" | tr '[:upper:]' '[:lower:]')
         ok=1
-        for w in $q; do
+        for w in "${qw[@]}"; do
             [[ "$hay" == *"$w"* ]] || { ok=0; break; }
         done
         [ "$ok" = 1 ] && PAL_HITS+=("$e")
@@ -3947,13 +4092,15 @@ menu_on_int() {
 }
 
 menu() {
-    local choice rc key tg
+    local choice rc key tg arg
     TOAST=""
+    # -y/-q/--fix/--json فقط برای دستورهای خط فرمانن؛ توی منو هر سؤال پرسیده میشه
+    ASSUME_YES=0; QUIET=0; DOC_FIX=0; JSON=0
     if [ ! -t 0 ]; then
         usage
         exit 1
     fi
-    # Ctrl+C: توی منوی اصلی → خروج؛ توی صفحه تونل → برگشت؛ وسط یه کار → فقط همون کار متوقف میشه
+    # Ctrl+C: وقتی منتظر تایپ توئه (منو، صفحه تونل، جستجو) → خروج؛ وسط یه کار → فقط همون کار متوقف میشه
     MENU_IDLE=1
     trap 'menu_on_int' INT
     since_visit_init
@@ -3975,7 +4122,8 @@ menu() {
             i)               run_action long env_bulk ;;
             u)               run_action long cmd_rollback ;;
             b)               run_action long cmd_backup ;;
-            m|monitor)       MENU_IDLE=0; ( trap 'exit 130' INT; cmd_monitor ); MENU_IDLE=1 ;;
+            m|monitor)       MENU_IDLE=0; ( trap 'exit 130' INT; cmd_monitor ); rc=$?; MENU_IDLE=1
+                             [ "$rc" = 1 ] && TOAST="${YELLOW}! monitor: no tunnels yet${NC}" ;;
             t|test)          run_action long cmd_test all ;;
             d|doctor)        run_action long run_locked cmd_doctor ;;
             s|status)        run_action long env_verbose cmd_status ;;
@@ -3987,16 +4135,18 @@ menu() {
             down-all)        run_action long run_locked cmd_down_all ;;
             delete|remove)   run_action long cmd_delete ;;
             rollback|undo)   run_action long cmd_rollback ;;
-            rollback\ *|undo\ *) run_action long cmd_rollback "${choice#* }" ;;
+            rollback\ *|undo\ *) run_action long cmd_rollback "$(trim "${choice#* }")" ;;
             import)          run_action long env_bulk ;;
-            import\ *)       run_action long cmd_import_bulk "${choice#* }" ;;
-            delete\ *|remove\ *) run_action long cmd_delete "${choice#* }" ;;
+            import\ *)       arg=$(trim "${choice#* }")
+                             if [ -d "$arg" ] || [[ "$arg" == *.[Zz][Ii][Pp] ]]; then run_action long cmd_import_bulk "$arg"
+                             else run_action long cmd_add file "$arg"; fi ;;
+            delete\ *|remove\ *) run_action long cmd_delete "$(trim "${choice#* }")" ;;
             enable|disable|restart)
-                             run_action long run_locked "cmd_$choice" ;;
+                             run_action long "cmd_$choice" ;;
             edit)            run_action long cmd_edit ;;      # edit خودش فقط موقع ذخیره قفل میگیره
             enable\ *|disable\ *|restart\ *)
-                             run_action long run_locked "cmd_${choice%% *}" "${choice#* }" ;;
-            test\ *|edit\ *) run_action long "cmd_${choice%% *}" "${choice#* }" ;;
+                             run_action long "cmd_${choice%% *}" "$(trim "${choice#* }")" ;;
+            test\ *|edit\ *) run_action long "cmd_${choice%% *}" "$(trim "${choice#* }")" ;;
             *)
                 # <#> → صفحه تونل؛ r2 / 2r / r 1,3 / r all → کار روی تونل
                 if [[ "$choice" =~ ^[0-9]+$ ]]; then
@@ -4033,7 +4183,11 @@ resolve_cmd() {
     local c hits=()
     [ -z "$CMD" ] && return 0
     [[ " $ALL_CMDS $CMD_ALIASES " == *" $CMD "* ]] && return 0
-    for c in $ALL_CMDS; do [[ "$c" == "$CMD"* ]] && hits+=("$c"); done
+    for c in $ALL_CMDS; do
+        # دستورهای پرخطر فقط با اسم کامل ("u" نباید up-all بشه، "dow" نباید همه رو خاموش کنه)
+        case "$c" in up-all|down-all|delete|restore|install) continue ;; esac
+        [[ "$c" == "$CMD"* ]] && hits+=("$c")
+    done
     case ${#hits[@]} in
         1) [ -t 1 ] && echo -e "  ${DIM}→ ${hits[0]}${NC}"
            CMD="${hits[0]}"; return 0 ;;
@@ -4080,7 +4234,7 @@ main() {
     # کانفیگ‌ها مال یه نسخه جدیدترن (مثلاً بعد از برگشت به نسخه قدیمی) → فقط خوندنی
     if [ "$(schema_current)" -gt "$SCHEMA_VERSION" ]; then
         case "$CMD" in
-            status|list|logs|test|backup|monitor) ;;
+            status|list|logs|test|backup|monitor|top|help|version|-h|--help|--version) ;;
             *) err "These configs were written by a newer wg-manager — install that version (only status/logs/test/backup work here)"
                exit 1 ;;
         esac
@@ -4091,8 +4245,9 @@ main() {
     # status/test/logs/backup چیزی رو عوض نمیکنن (و 'logs -f' نباید watchdog رو بلاک کنه)
     case "$CMD" in
         doctor|check)
-            if [ "$QUIET" = 1 ]; then watchdog_lock || exit 0; else lock || exit 1; fi ;;
-        enable|load|up|disable|down|restart|up-all|down-all|install|install-service)
+            # فقط watchdog (--fix -q) دور رو رد میکنه؛ doctor -q دستی نباید بی‌صدا «سالم» برگردونه
+            if [ "$QUIET" = 1 ] && [ "$DOC_FIX" = 1 ]; then watchdog_lock || exit 0; else lock || exit 1; fi ;;
+        up-all|down-all|install|install-service)
             lock || exit 1 ;;
     esac
 
@@ -4113,7 +4268,7 @@ main() {
         import)
             [ -n "$ARG1" ] || { err "Usage: wg-manager import <file.conf|configs.zip|folder> [name]"; exit 1; }
             # zip یا پوشه → چندتایی؛ یه فایل .conf → مثل قبل
-            if [ -d "$ARG1" ] || [[ "$ARG1" == *.zip ]]; then cmd_import_bulk "$ARG1"
+            if [ -d "$ARG1" ] || [[ "$ARG1" == *.[Zz][Ii][Pp] ]]; then cmd_import_bulk "$ARG1"
             else cmd_add file "$ARG1" "$ARG2"; fi ;;
         create)              cmd_add manual ;;
         enable|load|up)      cmd_enable "$ARG1" ;;
